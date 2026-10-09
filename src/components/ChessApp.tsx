@@ -13,6 +13,7 @@ import {
   judgmentClass,
   levelName,
   moveAccuracy,
+  moveNote,
   moverCp,
   toWhiteEval,
   type Judgment,
@@ -57,6 +58,7 @@ type MoveReview = {
   judgment: Judgment;
   lossCp: number;
   accuracy: number;
+  note: string;
   bestUci: string;
   bestSan: string;
   evalBefore: WhiteEval;
@@ -79,6 +81,19 @@ const PROMO_LABEL: Record<Promo, string> = {
   b: "Bispo",
   n: "Cavalo",
 };
+
+const PIECE_VALUE: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+
+function moverMaterial(fen: string, color: "w" | "b") {
+  const chess = new Chess(fen);
+  let total = 0;
+  for (const row of chess.board()) {
+    for (const piece of row) {
+      if (piece && piece.color === color) total += PIECE_VALUE[piece.type] ?? 0;
+    }
+  }
+  return total;
+}
 
 function asPromo(piece: string | undefined): Promo | undefined {
   if (piece === "q" || piece === "r" || piece === "b" || piece === "n") return piece;
@@ -162,15 +177,15 @@ export function ChessApp() {
   const summary = useMemo(() => {
     if (!activeReview) return null;
     const bag: Record<"w" | "b", number[]> = { w: [], b: [] };
-    const counts: Record<"w" | "b", Record<"inaccuracy" | "mistake" | "blunder", number>> = {
-      w: { inaccuracy: 0, mistake: 0, blunder: 0 },
-      b: { inaccuracy: 0, mistake: 0, blunder: 0 },
+    const counts: Record<"w" | "b", Record<"inaccuracy" | "mistake" | "miss" | "blunder", number>> = {
+      w: { inaccuracy: 0, mistake: 0, miss: 0, blunder: 0 },
+      b: { inaccuracy: 0, mistake: 0, miss: 0, blunder: 0 },
     };
     for (const [index, item] of Object.entries(activeReview.moves)) {
       const ply = plies[Number(index)];
       if (!ply?.color) continue;
       bag[ply.color].push(item.accuracy);
-      if (item.judgment === "inaccuracy" || item.judgment === "mistake" || item.judgment === "blunder") {
+      if (item.judgment === "inaccuracy" || item.judgment === "mistake" || item.judgment === "miss" || item.judgment === "blunder") {
         counts[ply.color][item.judgment] += 1;
       }
     }
@@ -608,9 +623,10 @@ export function ChessApp() {
         const before = new Chess(beforeFen);
         if (before.isGameOver()) break;
         const forced = before.moves().length === 1;
-        const searched = await engine.search({ fen: beforeFen, depth: REVIEW_DEPTH, movetime: 1800, multipv: 1 });
+        const searched = await engine.search({ fen: beforeFen, depth: REVIEW_DEPTH, movetime: 1800, multipv: 2 });
         if (jobRef.current !== job || searched.cancelled) return;
         const top = searched.lines.find((line) => line.multipv === 1) ?? searched.lines[0];
+        const second = searched.lines.find((line) => line.multipv === 2);
         const evalBefore = top ? toWhiteEval(top.scoreCp, top.mate, before.turn()) : ZERO;
         const playedBest = forced || searched.bestmove === ply.uci;
         let evalAfter = evalBefore;
@@ -623,16 +639,23 @@ export function ChessApp() {
           evalAfter = secondTop ? toWhiteEval(secondTop.scoreCp, secondTop.mate, after.turn()) : evalBefore;
         }
         const lossCp = playedBest ? 0 : Math.max(0, moverCp(evalBefore, ply.color) - moverCp(evalAfter, ply.color));
-        const judgment = classifyMove(lossCp, playedBest);
-        const accuracy = playedBest
-          ? 100
-          : moveAccuracy(cpToWinPercent(moverCp(evalBefore, ply.color)), cpToWinPercent(moverCp(evalAfter, ply.color)));
+        const winBefore = cpToWinPercent(moverCp(evalBefore, ply.color));
+        const winAfter = cpToWinPercent(moverCp(evalAfter, ply.color));
+        const winLoss = playedBest ? 0 : Math.max(0, winBefore - winAfter);
+        const topCp = top ? moverCp(toWhiteEval(top.scoreCp, top.mate, before.turn()), ply.color) : 0;
+        const secondCp = second ? moverCp(toWhiteEval(second.scoreCp, second.mate, before.turn()), ply.color) : topCp;
+        const onlyGood = Boolean(second) && (top?.mate != null && second?.mate == null ? true : topCp - secondCp >= 120);
+        const sacrifice = playedBest && !forced && moverMaterial(beforeFen, ply.color) - moverMaterial(ply.fen, ply.color) >= 1;
+        const judgment = classifyMove({ lossCp, winLoss, playedBest, forced, onlyGood, sacrifice });
+        const accuracy = playedBest ? 100 : moveAccuracy(winBefore, winAfter);
+        const bestSan = sanOfUci(beforeFen, searched.bestmove);
         moves[index] = {
           judgment,
           lossCp,
           accuracy,
+          note: moveNote(judgment, bestSan, playedBest || searched.bestmove === ply.uci),
           bestUci: searched.bestmove,
-          bestSan: sanOfUci(beforeFen, searched.bestmove),
+          bestSan,
           evalBefore,
           evalAfter,
           forced,
@@ -673,7 +696,7 @@ export function ChessApp() {
     const from = ply.from;
     const to = ply.to;
     if (from && to) {
-      const harsh = item.judgment === "inaccuracy" || item.judgment === "mistake" || item.judgment === "blunder";
+      const harsh = item.judgment === "inaccuracy" || item.judgment === "mistake" || item.judgment === "miss" || item.judgment === "blunder";
       arrows.push({ from, to, tone: harsh ? "bad" : "good" });
     }
     if (item.bestUci.length >= 4 && item.bestUci !== ply.uci) {
@@ -859,10 +882,13 @@ export function ChessApp() {
             </p>
           ) : null}
           {focusReview && focusPly?.san ? (
-            <p className={`mx-auto w-full max-w-xl text-sm ${judgmentClass(focusReview.judgment)}`}>
-              {focusPly.san} · {JUDGMENT_META[focusReview.judgment].label}
-              {focusReview.bestUci !== focusPly.uci ? ` · melhor era ${focusReview.bestSan}` : ""}
-            </p>
+            <>
+              <p className={`mx-auto w-full max-w-xl text-sm ${judgmentClass(focusReview.judgment)}`}>
+                {focusPly.san} · {JUDGMENT_META[focusReview.judgment].label}
+                {focusReview.bestUci !== focusPly.uci ? ` · melhor era ${focusReview.bestSan}` : ""}
+              </p>
+              <p className="mx-auto w-full max-w-xl text-sm text-muted">{focusReview.note}</p>
+            </>
           ) : null}
         </section>
 
@@ -1026,12 +1052,13 @@ export function ChessApp() {
                 </button>
               )}
               <p className="mb-3 text-sm text-muted">
-                Cada lance é comparado com o Stockfish na profundidade {REVIEW_DEPTH}. Imprecisão, erro e erro grave aparecem na lista.
+                Cada lance ganha uma categoria, como no Chess.com: brilhante, ótimo, melhor, excelente, bom, imprecisão, erro, lance perdido ou erro grave. A conta usa a chance de vitória, não só os peões.
               </p>
               {summary && activeReview?.status === "done" ? (
                 <div className="mb-3 grid grid-cols-2 gap-2">
                   <Stat label="Brancas" value={formatPercent(summary.white)} />
                   <Stat label="Pretas" value={formatPercent(summary.black)} />
+                  <Count label="Lances perdidos" white={summary.counts.w.miss} black={summary.counts.b.miss} />
                   <Count label="Imprecisões" white={summary.counts.w.inaccuracy} black={summary.counts.b.inaccuracy} />
                   <Count label="Erros" white={summary.counts.w.mistake} black={summary.counts.b.mistake} />
                   <Count label="Erros graves" white={summary.counts.w.blunder} black={summary.counts.b.blunder} />
@@ -1043,7 +1070,8 @@ export function ChessApp() {
                     {focusPly.san} · {JUDGMENT_META[focusReview.judgment].label}
                     {focusReview.lossCp > 8 ? ` · −${(focusReview.lossCp / 100).toFixed(1)}` : ""}
                   </p>
-                  <p className="mt-1 text-ink">
+                  <p className="mt-1 text-ink">{focusReview.note}</p>
+                  <p className="mt-1 text-muted">
                     {formatEval(focusReview.evalBefore)} → {formatEval(focusReview.evalAfter)}
                     {focusReview.bestUci !== focusPly.uci ? ` · melhor era ${focusReview.bestSan}` : ""}
                     {focusReview.forced ? " · lance único" : ""}

@@ -1,4 +1,13 @@
-export type Judgment = "best" | "excellent" | "good" | "inaccuracy" | "mistake" | "blunder";
+export type Judgment =
+  | "brilliant"
+  | "great"
+  | "best"
+  | "excellent"
+  | "good"
+  | "inaccuracy"
+  | "mistake"
+  | "miss"
+  | "blunder";
 
 export type WhiteEval = {
   cp: number;
@@ -9,11 +18,14 @@ export const JUDGMENT_META: Record<
   Judgment,
   { label: string; glyph: string; tone: "ink" | "good" | "muted" | "warn" | "bad" }
 > = {
+  brilliant: { label: "Brilhante", glyph: "!!", tone: "good" },
+  great: { label: "Ótimo", glyph: "!", tone: "good" },
   best: { label: "Melhor lance", glyph: "", tone: "ink" },
   excellent: { label: "Excelente", glyph: "", tone: "good" },
   good: { label: "Bom", glyph: "", tone: "muted" },
   inaccuracy: { label: "Imprecisão", glyph: "?!", tone: "warn" },
   mistake: { label: "Erro", glyph: "?", tone: "bad" },
+  miss: { label: "Perdeu o lance", glyph: "✕", tone: "warn" },
   blunder: { label: "Erro grave", glyph: "??", tone: "bad" },
 };
 
@@ -75,13 +87,63 @@ export function moveAccuracy(winBefore: number, winAfter: number) {
   return Math.max(0, Math.min(100, raw));
 }
 
-export function classifyMove(lossCp: number, playedBest: boolean): Judgment {
-  if (playedBest || lossCp <= 8) return "best";
-  if (lossCp <= 25) return "excellent";
-  if (lossCp <= 50) return "good";
-  if (lossCp <= 100) return "inaccuracy";
-  if (lossCp <= 250) return "mistake";
+export type MoveClassInput = {
+  /** Centipawns lost from the mover's point of view. */
+  lossCp: number;
+  /** Win-percent lost from the mover's point of view (0–100). */
+  winLoss: number;
+  playedBest: boolean;
+  forced: boolean;
+  /** Best move is clearly better than the second engine line. */
+  onlyGood: boolean;
+  /** Played best while giving material. */
+  sacrifice: boolean;
+};
+
+/**
+ * Chess.com-style buckets on expected points, not raw centipawns.
+ * A 0.2 pawn slip in a dead draw is not the same as throwing a winning attack.
+ */
+export function classifyMove(input: MoveClassInput): Judgment {
+  const { lossCp, winLoss, playedBest, forced, onlyGood, sacrifice } = input;
+  if (forced || (playedBest && winLoss < 2 && lossCp <= 15)) {
+    if (sacrifice && !forced) return "brilliant";
+    if (onlyGood && !forced && playedBest) return "great";
+    return "best";
+  }
+  if (playedBest && sacrifice && winLoss < 4) return "brilliant";
+  if (playedBest && onlyGood) return "great";
+  if (!playedBest && onlyGood && winLoss >= 8) return "miss";
+  if (playedBest || winLoss < 2) return "best";
+  if (winLoss < 5) return "excellent";
+  if (winLoss < 10) return "good";
+  if (winLoss < 15) return "inaccuracy";
+  if (winLoss < 25) return "mistake";
   return "blunder";
+}
+
+export function moveNote(judgment: Judgment, bestSan: string, playedBest: boolean): string {
+  const alt = bestSan && !playedBest ? bestSan : "";
+  switch (judgment) {
+    case "brilliant":
+      return "Sacrifício que o motor aprova. Lance difícil de encontrar.";
+    case "great":
+      return "Único lance que segura a posição. As outras opções pioravam bastante.";
+    case "best":
+      return playedBest ? "Esse é o lance do motor." : "Praticamente o melhor. Quase nada se perdeu.";
+    case "excellent":
+      return alt ? `Excelente. ${alt} era só um fio melhor.` : "Excelente. Quase não há o que melhorar.";
+    case "good":
+      return alt ? `Bom lance. ${alt} era mais preciso.` : "Bom lance. A posição segue parecida.";
+    case "inaccuracy":
+      return alt ? `Imprecisão. ${alt} mantinha a posição melhor.` : "Imprecisão. A posição piorou um pouco.";
+    case "mistake":
+      return alt ? `Erro. ${alt} evitava ceder essa vantagem.` : "Erro. Abriu mão de uma boa parte da avaliação.";
+    case "miss":
+      return alt ? `Deixou passar o lance crítico: ${alt}.` : "Deixou passar o único lance que segurava a posição.";
+    case "blunder":
+      return alt ? `Erro grave. ${alt} era necessário.` : "Erro grave. A avaliação despencou.";
+  }
 }
 
 export function average(values: number[]) {
